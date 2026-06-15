@@ -10,6 +10,7 @@
 |---|------|-------------|
 | 1 | [Task 1](#task-1-risc-v-toolchain-setup--c-compilation) | Compile C code using GCC and the RISC-V GNU Toolchain |
 | 2 | [Task 2](#task-2-spike-simulation-of-the-compiled-c-code) | Spike simulation of RISC-V assembly code and observation |
+| 3 | [Task 3](#task-3-risc-v-reference-design-bring-up) | Use the VSD Codespace to run a pre-built RISC-V + FPGA environment and replicate the toolchain locally |
 
 ---
 
@@ -351,6 +352,171 @@ Locate the `main` function address from the object dump, then run the program co
 
 ---
 
+---
+
+## Task 3: RISC-V Reference Design Bring-Up
+
+**Objective:** Use the VSD-provided GitHub Codespace (a pre-configured cloud environment) to explore and run a complete RISC-V + FPGA reference design. Verify the pre-installed toolchain, compile and simulate a sample C program, build the RISC-V logo firmware, and then replicate the same toolchain setup on a local Fedora machine.
+
+---
+
+### Step 1 — Launch the VSD Codespace & Verify Tools
+
+The VSD internship provides a GitHub Codespace with the RISC-V toolchain (SiFive GCC 8.3.0), Spike simulator, and Icarus Verilog pre-installed. After launching the codespace, verify all tools are present:
+
+```bash
+riscv64-unknown-elf-gcc --version
+spike --help
+iverilog -V
+```
+
+**Expected output:**
+```
+riscv64-unknown-elf-gcc (SiFive GCC 8.3.0-2019.08.0) 8.3.0
+Spike RISC-V ISA Simulator 1.1.1-dev
+```
+
+![Tool verification in VSD Codespace](images/task3/Screenshot%20from%202026-06-15%2017-33-39.png)
+
+---
+
+### Step 2 — Compile and Run the Sample Program
+
+The codespace ships with a `samples/` directory containing example programs. Navigate to it, compile `sum1ton.c` using the RISC-V cross-compiler, and simulate it with Spike:
+
+```bash
+ls
+cd samples
+ls
+riscv64-unknown-elf-gcc -o sum1ton.o sum1ton.c
+spike pk sum1ton.o
+```
+
+**Expected output:**
+```
+bbl loader
+Sum from 1 to 9 is 45
+```
+
+![Compiling and running sum1ton in the Codespace](images/task3/Screenshot%20from%202026-06-15%2017-35-06.png)
+
+---
+
+### Step 3 — Install the Full FPGA + RISC-V Toolchain (Codespace)
+
+The codespace also contains a `vsdfpga_labs/` directory with a setup script that installs the complete toolchain — general build tools, the FPGA synthesis stack (Yosys, nextpnr-ice40, IceStorm, Icarus Verilog), and the SiFive RISC-V GCC 8.3.0 cross-compiler:
+
+```bash
+# General dependencies
+sudo apt-get install git vim autoconf automake autotools-dev curl libmpc-dev \
+  libmpfr-dev libgmp-dev gawk build-essential bison flex texinfo gperf libtool \
+  patchutils bc zlib1g-dev libexpat1-dev gtkwave picocom -y
+
+# FPGA toolchain (Yosys/NextPNR/IceStorm)
+sudo apt-get install yosys nextpnr-ice40 icestorm iverilog -y
+
+# RISC-V Toolchain (GCC 8.3.0)
+cd ~
+mkdir -p riscv_toolchain && cd riscv_toolchain
+wget "https://static.dev.sifive.com/dev-tools/riscv64-unknown-elf-gcc-8.3.0-2019.08.0-x86_64-linux-ubuntu14.tar.gz"
+tar -xvzf riscv64-unknown-elf-gcc-*.tar.gz
+echo 'export PATH=$HOME/riscv_toolchain/riscv64-unknown-elf-gcc-8.3.0-2019.08.0-x86_64-linux-ubuntu14/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+![Running the setup script in the Codespace](images/task3/Screenshot%20from%202026-06-15%2017-38-37.png)
+
+![Toolchain extraction and bram hex build](images/task3/Screenshot%20from%202026-06-15%2017-39-55.png)
+
+---
+
+### Step 4 — Build the RISC-V Logo Firmware
+
+Navigate to the `basicRISCV/Firmware` directory inside `vsdfpga_labs` and build the reference firmware:
+
+```bash
+cd ~/vsdfpga_labs/basicRISCV/Firmware
+# Review and close (Ctrl+X)
+make riscv_logo.bram.hex
+```
+
+**Expected output:**
+```
+make: 'riscv_logo.bram.hex' is up to date.
+```
+
+![Building riscv_logo.bram.hex firmware](images/task3/Screenshot%20from%202026-06-15%2023-03-31.png)
+
+---
+
+### Step 5 — Run the RISC-V Logo Program with Spike
+
+Compile the `riscv_logo.c` program and simulate it with Spike to confirm the firmware and toolchain are working end-to-end:
+
+```bash
+riscv64-unknown-elf-gcc -O0 -mabi=lp64 -march=rv64i -o riscv_logo.o riscv_logo.c
+spike pk riscv_logo.o
+```
+
+A successful run prints the VSD ASCII art banner:
+
+```
+bbl loader
+************************************************************
+*  LEARN TO THINK LIKE A CHIP  *
+*     VSDSQUADRON FPGA MINI     *
+*BRINGS RISC-V TO VSD CLASSROOM*
+************************************************************
+```
+
+![Spike simulation output showing VSD ASCII art logo](images/task3/Screenshot%20from%202026-06-15%2023-05-12.png)
+
+---
+
+### Step 6 — Replicate the Toolchain on a Local Fedora Machine
+
+To run the same environment locally (outside the Codespace), install the equivalent packages on Fedora and download the SiFive toolchain tarball:
+
+```bash
+# Update package manager
+sudo dnf update
+
+# Install general build tools
+sudo dnf install -y git vim autoconf automake autotools-dev curl \
+  libmpc-dev libmpfr-dev libgmp-dev gawk build-essential bison flex \
+  texinfo gperf libtool patchutils bc zlib1g-dev libexpat1-dev
+
+# Install FPGA-specific tools
+sudo dnf install -y yosys nextpnr-ice40 fpga-icestorm iverilog
+
+# Install simulation and debugging tools
+sudo dnf install -y gtkwave picocom
+```
+
+![Installing dependencies on local Fedora machine](images/task3/Screenshot%20from%202026-06-15%2023-06-49.png)
+
+Then download and extract the SiFive RISC-V GCC 8.3.0 toolchain, and verify the installation:
+
+```bash
+mkdir -p ~/riscv_toolchain && cd ~/riscv_toolchain
+wget "https://static.dev.sifive.com/dev-tools/riscv64-unknown-elf-gcc-8.3.0-2019.08.0-x86_64-linux-ubuntu14.tar.gz"
+tar -xvzf riscv64-unknown-elf-gcc-*.tar.gz
+export PATH=$HOME/riscv_toolchain/riscv64-unknown-elf-gcc-8.3.0-2019.08.0-x86_64-linux-ubuntu14/bin:$PATH
+riscv64-unknown-elf-gcc --version
+```
+
+**Expected output:**
+```
+riscv64-unknown-elf-gcc (SiFive GCC 8.3.0-2019.08.0) 8.3.0
+Copyright (C) 2018 Free Software Foundation, Inc.
+```
+
+![Local Fedora toolchain extraction and version verification](images/task3/Screenshot%20from%202026-06-15%2023-17-47.png)
+
+> **Key Observation:** The VSD Codespace provides a ready-made reference environment. Replicating it locally confirms that the same SiFive GCC 8.3.0 toolchain and Spike workflow work identically on a local Fedora machine.
+
+---
+
 ## Repository Structure
 
 ```
@@ -362,13 +528,22 @@ VSD-internship/
 │   │   ├── c.png       # RISC-V -O1 disassembly
 │   │   ├── d.png       # RISC-V -Ofast disassembly (part 1)
 │   │   └── e.png       # RISC-V -Ofast disassembly (part 2)
-│   └── task2/          # Screenshots for Task 2
-│       ├── a.png       # GCC and RISC-V toolchain compilation output (Part A)
-│       ├── b.png       # Object dump of sum1ton.o (Part A)
-│       ├── c.png       # Spike debugger session (Part A)
-│       ├── d.png       # GCC and RISC-V toolchain compilation output (Part B)
-│       ├── e.png       # Object dump of fibonacci.o (Part B)
-│       └── f.png       # Spike debugger session for fibonacci.o (Part B)
+│   ├── task2/          # Screenshots for Task 2
+│   │   ├── a.png       # GCC and RISC-V toolchain compilation output (Part A)
+│   │   ├── b.png       # Object dump of sum1ton.o (Part A)
+│   │   ├── c.png       # Spike debugger session (Part A)
+│   │   ├── d.png       # GCC and RISC-V toolchain compilation output (Part B)
+│   │   ├── e.png       # Object dump of fibonacci.o (Part B)
+│   │   └── f.png       # Spike debugger session for fibonacci.o (Part B)
+│   └── task3/          # Screenshots for Task 3
+│       ├── a.png       # Tool verification in VSD Codespace
+│       ├── b.png       # Compiling and running sum1ton in the Codespace
+│       ├── c.png       # Running the FPGA+RISC-V setup script
+│       ├── d.png       # Toolchain extraction and bram hex build
+│       ├── e.png       # Building riscv_logo.bram.hex
+│       ├── f.png       # Spike simulation VSD ASCII art output
+│       ├── g.png       # Installing dependencies on local Fedora
+│       └── h.png       # Local Fedora toolchain verification
 └── README.md
 ```
 
@@ -378,3 +553,4 @@ VSD-internship/
 
 - [VLSI System Design (VSD)](https://www.vlsisystemdesign.com/) — for the internship program and curriculum
 - [RISC-V GNU Toolchain](https://github.com/riscv-collab/riscv-gnu-toolchain) — the open-source cross-compilation toolchain used throughout
+- [SiFive](https://www.sifive.com/) — for the pre-built RISC-V GCC 8.3.0 toolchain distribution
