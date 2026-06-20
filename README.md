@@ -11,6 +11,7 @@
 | 1 | [Task 1](#task-1-risc-v-toolchain-setup--c-compilation) | Compile C code using GCC and the RISC-V GNU Toolchain |
 | 2 | [Task 2](#task-2-spike-simulation-of-the-compiled-c-code) | Spike simulation of RISC-V assembly code and observation |
 | 3 | [Task 3](#task-3-risc-v-reference-design-bring-up) | Use the VSD Codespace to run a pre-built RISC-V + FPGA environment and replicate the toolchain locally |
+| 4 | [Task 4](#task-4-gpio32-ip-design-integration--simulation) | Design a 32-bit memory-mapped GPIO register IP, integrate it into the basicRISCV SoC, and verify with Icarus Verilog simulation |
 
 ---
 
@@ -517,6 +518,205 @@ Copyright (C) 2018 Free Software Foundation, Inc.
 
 ---
 
+## Task 4: GPIO32 IP Design, Integration & Simulation
+
+**Objective:** Design a 32-bit memory-mapped GPIO output register IP from scratch, integrate it into the existing `basicRISCV` SoC as a new peripheral, write bare-metal C firmware to write and read back test patterns, and verify correctness using Icarus Verilog simulation with GTKWave waveform analysis.
+
+---
+
+### Step 1 — Understand the Existing SoC Architecture
+
+Before writing any RTL, the existing `riscv.v` SoC was studied to understand the bus signals and IO address decode scheme.
+
+**Bus signals** shared between the CPU and all peripherals:
+
+| Signal | Width | Direction | Purpose |
+|--------|-------|-----------|---------|
+| `mem_addr` | 32-bit | CPU → Peripheral | Address |
+| `mem_rdata` | 32-bit | Peripheral → CPU | Read data mux |
+| `mem_wdata` | 32-bit | CPU → Peripheral | Write data |
+| `mem_wmask` | 4-bit | CPU → Peripheral | Byte-enable mask |
+| `mem_rstrb` | 1-bit | CPU → Peripheral | Read strobe |
+
+**IO address decode** — the SoC uses a **1-hot scheme on `mem_wordaddr = mem_addr[31:2]`**. Each peripheral bit `N` corresponds to `addr bit (N+2)` being set:
+
+| IO Bit | Peripheral | Address |
+|--------|-----------|---------|
+| `0` | LEDs (5-bit write) | `0x400004` |
+| `1` | UART TX data (write) | `0x400008` |
+| `2` | UART status (read) | `0x400010` |
+| **`3`** | **GPIO32 register (R/W)** | **`0x400020`** |
+
+The read path is a combinational wire mux: `assign mem_rdata = isRAM ? RAM_rdata : IO_rdata`
+
+---
+
+### Step 2 — Write the GPIO32 RTL Module
+
+A new file `GPIO32.v` was created implementing a single 32-bit output register:
+
+```verilog
+module GPIO32 (
+    input             clk,       // system clock
+    input             resetn,    // active-low synchronous reset
+    input             sel,       // address select (decoded externally)
+    input             wstrb,     // write strobe (= |mem_wmask)
+    input      [31:0] wdata,     // write data from CPU
+    output     [31:0] rdata,     // read data to CPU (combinational)
+    output reg [31:0] gpio_out   // GPIO output register
+);
+    // Synchronous write with active-low reset
+    always @(posedge clk) begin
+        if (!resetn)
+            gpio_out <= 32'b0;
+        else if (sel & wstrb)
+            gpio_out <= wdata;
+    end
+    // Combinational readback
+    assign rdata = gpio_out;
+endmodule
+```
+
+**Design principles:** synchronous write, combinational read, active-low reset clears to zero. Correctness first — no optimizations.
+
+---
+
+### Step 3 — Integrate GPIO32 into the SoC
+
+The following changes were made to `riscv.v`:
+
+**1. Include the new module and add address decode bit:**
+```verilog
+`include "GPIO32.v"
+// ...
+localparam IO_GPIO_bit = 3;  // R/W 32-bit GPIO register (addr 0x400020)
+```
+
+**2. Instantiate the peripheral and expose `GPIO_OUT` as a SoC port:**
+```verilog
+wire [31:0] gpio_rdata;
+GPIO32 gpio_ip (
+    .clk     (clk),
+    .resetn  (resetn),
+    .sel     (isIO & mem_wordaddr[IO_GPIO_bit]),
+    .wstrb   (mem_wstrb),
+    .wdata   (mem_wdata),
+    .rdata   (gpio_rdata),
+    .gpio_out(GPIO_OUT)
+);
+```
+
+**3. Extend the IO read-data mux:**
+```verilog
+wire [31:0] IO_rdata =
+    mem_wordaddr[IO_UART_CNTL_bit] ? {22'b0, !uart_ready, 9'b0} :
+    mem_wordaddr[IO_GPIO_bit]      ? gpio_rdata                  :
+                                     32'b0;
+```
+
+---
+
+### Step 4 — Write the Firmware Test Program
+
+A bare-metal C test program (`firmware/gpio_test.c`) writes four test patterns to the GPIO register and reads them back, printing PASS/FAIL via UART:
+
+```c
+#define UART_DAT  (*(volatile uint32_t*)0x400008)
+#define UART_CNTL (*(volatile uint32_t*)0x400010)
+#define GPIO_REG  (*(volatile uint32_t*)0x400020)
+
+int main(void) {
+    uint32_t test_vals[] = { 0xDEADBEEF, 0xA5A5A5A5, 0x00000001, 0x00000000 };
+    for (int i = 0; i < 4; i++) {
+        GPIO_REG = test_vals[i];           // WRITE
+        uint32_t readback = GPIO_REG;      // READ BACK
+        uart_puts(readback == test_vals[i] ? " [ PASS ]\r\n" : " [ FAIL ]\r\n");
+    }
+}
+```
+
+The firmware is built with the bare-metal RISC-V toolchain (rv32i):
+
+```bash
+cd RTL/firmware
+make    # compiles start.S + gpio_test.c → firmware.hex
+```
+
+```
+start.S + gpio_test.c
+    ↓ riscv64-unknown-elf-gcc -march=rv32i -mabi=ilp32
+firmware.elf
+    ↓ objcopy -O binary + bin2hex.py
+firmware.hex  ← loaded by $readmemh() in simulation
+```
+
+---
+
+### Step 5 — Simulate with Icarus Verilog
+
+A simulation top-level wrapper `SOC_sim_top.v` was created that generates its own clock, drives reset, and monitors `GPIO_OUT`. The iCE40-specific oscillator (`SB_HFOSC`) is bypassed using `ifdef SIM`:
+
+```bash
+# Compile
+iverilog -DBENCH -DSIM -g2012 -o SOC_sim.vvp SOC_sim_top.v riscv.v
+
+# Run
+vvp SOC_sim.vvp
+```
+
+**Simulation output:**
+
+```
+=== GPIO32 Register Test ===
+[TB] GPIO_OUT changed to 0xdeadbeef at time 18245000 ns
+Write: 0xDEADBEEF  Read: 0xDEADBEEF  [ PASS ]
+[TB] GPIO_OUT changed to 0xa5a5a5a5 at time 47335000 ns
+Write: 0xA5A5A5A5  Read: 0xA5A5A5A5  [ PASS ]
+[TB] GPIO_OUT changed to 0x00000001 at time 76745000 ns
+Write: 0x00000001  Read: 0x00000001  [ PASS ]
+[TB] GPIO_OUT changed to 0x00000000 at time 106475000 ns
+Write: 0x00000000  Read: 0x00000000  [ PASS ]
+----------------------------
+Results: 4/4 passed
+```
+
+
+---
+
+### Step 6 — GTKWave Waveform Analysis
+
+A VCD waveform is generated and converted to the compact FST format, then opened in GTKWave to confirm bus transactions visually:
+
+```bash
+# Generate waveform
+iverilog -DBENCH -DSIM -DDUMP -g2012 -o SOC_sim.vvp SOC_sim_top.v riscv.v && vvp SOC_sim.vvp
+
+# Convert to compact FST (340 MB → 260 KB)
+vcd2fst gpio_sim.vcd gpio_sim.fst
+
+# Open with pre-configured signal layout
+gtkwave gpio_sim.fst gpio32_sim.gtkw
+```
+
+At each GPIO write transaction the waveform confirms:
+- `mem_addr = 0x400020` (GPIO address selected)
+- `mem_wmask = 4'b1111` (full 32-bit word write)
+- `GPIO_OUT` latches the new value one clock cycle after the write strobe
+
+![GTKWave waveform showing GPIO32 write transactions](images/task4/a.png)
+
+---
+
+### Key Learnings
+
+> **IO Address Decode (1-hot scheme):** The SoC does NOT use sequential byte offsets for IO. Peripheral bit `N` in the `localparam` corresponds to bit `N` of `mem_wordaddr = mem_addr[31:2]`. The actual byte address is `0x400000 | (1 << (N+2))`. Using the wrong address silently triggers multiple peripherals simultaneously.
+
+> **Simulation vs Hardware:** The iCE40 `SB_HFOSC` oscillator and `Clockworks` gearbox are hardware-only primitives. For simulation, a `CLK_SIM` port is conditionally added to SOC under `ifdef SIM`.
+
+> **Hex Format for `$readmemh`:** `objcopy -O verilog` produces byte-addressed Intel hex, which does not directly load into a `reg [31:0]` array. The correct format is one 32-bit little-endian word per line — generated by the `bin2hex.py` helper script.
+
+---
+
 ## Repository Structure
 
 ```
@@ -535,15 +735,17 @@ VSD-internship/
 │   │   ├── d.png       # GCC and RISC-V toolchain compilation output (Part B)
 │   │   ├── e.png       # Object dump of fibonacci.o (Part B)
 │   │   └── f.png       # Spike debugger session for fibonacci.o (Part B)
-│   └── task3/          # Screenshots for Task 3
-│       ├── a.png       # Tool verification in VSD Codespace
-│       ├── b.png       # Compiling and running sum1ton in the Codespace
-│       ├── c.png       # Running the FPGA+RISC-V setup script
-│       ├── d.png       # Toolchain extraction and bram hex build
-│       ├── e.png       # Building riscv_logo.bram.hex
-│       ├── f.png       # Spike simulation VSD ASCII art output
-│       ├── g.png       # Installing dependencies on local Fedora
-│       └── h.png       # Local Fedora toolchain verification
+│   ├── task3/          # Screenshots for Task 3
+│   │   ├── a.png       # Tool verification in VSD Codespace
+│   │   ├── b.png       # Compiling and running sum1ton in the Codespace
+│   │   ├── c.png       # Running the FPGA+RISC-V setup script
+│   │   ├── d.png       # Toolchain extraction and bram hex build
+│   │   ├── e.png       # Building riscv_logo.bram.hex
+│   │   ├── f.png       # Spike simulation VSD ASCII art output
+│   │   ├── g.png       # Installing dependencies on local Fedora
+│   │   └── h.png       # Local Fedora toolchain verification
+│   └── task4/          # Screenshots for Task 4
+│       └── a.png       # GTKWave simulation screenshot
 └── README.md
 ```
 
@@ -554,3 +756,5 @@ VSD-internship/
 - [VLSI System Design (VSD)](https://www.vlsisystemdesign.com/) — for the internship program and curriculum
 - [RISC-V GNU Toolchain](https://github.com/riscv-collab/riscv-gnu-toolchain) — the open-source cross-compilation toolchain used throughout
 - [SiFive](https://www.sifive.com/) — for the pre-built RISC-V GCC 8.3.0 toolchain distribution
+- [Icarus Verilog](http://iverilog.icarus.com/) — open-source Verilog simulator used for GPIO32 verification
+- [GTKWave](http://gtkwave.sourceforge.net/) — waveform viewer for post-simulation analysis
