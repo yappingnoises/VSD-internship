@@ -12,6 +12,7 @@
 | 2 | [Task 2](#task-2-spike-simulation-of-the-compiled-c-code) | Spike simulation of RISC-V assembly code and observation |
 | 3 | [Task 3](#task-3-risc-v-reference-design-bring-up) | Use the VSD Codespace to run a pre-built RISC-V + FPGA environment and replicate the toolchain locally |
 | 4 | [Task 4](#task-4-gpio32-ip-design-integration--simulation) | Design a 32-bit memory-mapped GPIO register IP, integrate it into the basicRISCV SoC, and verify with Icarus Verilog simulation |
+| 5 | [Task 5](#task-5-design-a-multi-register-gpio-ip-with-software-control) | Extend the simple GPIO IP into a multi-register GPIO peripheral with software-controlled direction and input/output modes |
 
 ---
 
@@ -717,6 +718,183 @@ At each GPIO write transaction the waveform confirms:
 
 ---
 
+## Task 5: Design a Multi-Register GPIO IP with Software Control
+
+**Objective:** Extend the simple 32-bit GPIO register from Task 4 into a multi-register, software-controlled GPIO peripheral. This includes designing a proper register map, implementing individual bit direction control (input vs. output mode), updating the SoC bus address decoding, writing bare-metal C test code, and validating functionality via Icarus Verilog simulation and GTKWave.
+
+---
+
+### Step 1 — Register Map Design
+
+The multi-register GPIO peripheral is mapped to base address **`0x400100`** in the SoC memory map. Address offsets within the peripheral are decoded using `mem_addr[3:2]`:
+
+| Offset | Register Name | Access | Description |
+|---|---|---|---|
+| `0x00` | `GPIO_DATA` | R/W | GPIO output data register |
+| `0x04` | `GPIO_DIR` | R/W | Direction register (1 = output, 0 = input) |
+| `0x08` | `GPIO_READ` | R | Readback register |
+
+#### How Address Offsets are Decoded
+In `riscv.v`, the GPIO_CTRL peripheral is selected when the CPU accesses the IO page (`isIO = 1`) and address bit 8 is high (`mem_addr[8] = 1`), mapping the block to `0x400100`. Inside `GPIO_CTRL.v`, register offsets are decoded using `mem_addr[3:2]` (which corresponds to word-aligned offsets: `0x00` is `2'b00`, `0x04` is `2'b01`, and `0x08` is `2'b10`).
+
+---
+
+### Step 2 — Implement Multi-Register RTL (`GPIO_CTRL.v`)
+
+A new module `GPIO_CTRL` was created to implement direction-masking and readback logic:
+
+```verilog
+module GPIO_CTRL (
+    input             clk,        // system clock
+    input             resetn,     // active-low synchronous reset
+    input             sel,        // block select: asserted when this IP is addressed
+    input      [1:0]  reg_sel,    // register select: mem_addr[3:2]
+    input             wstrb,      // write strobe: |mem_wmask
+    input      [31:0] wdata,      // write data from CPU
+    output reg [31:0] rdata,      // read data to IO_rdata mux
+    input      [31:0] gpio_in,    // GPIO input pin values (or loopback)
+    output     [31:0] gpio_out,   // GPIO output values (direction-masked)
+    output     [31:0] gpio_dir    // direction register (1=output, 0=input)
+);
+    localparam REG_DATA = 2'b00;  // 0x00
+    localparam REG_DIR  = 2'b01;  // 0x04
+    localparam REG_READ = 2'b10;  // 0x08
+
+    reg [31:0] gpio_data_reg;
+    reg [31:0] gpio_dir_reg;
+
+    // Synchronous write
+    always @(posedge clk) begin
+        if (!resetn) begin
+            gpio_data_reg <= 32'b0;
+            gpio_dir_reg  <= 32'b0; // all inputs by default
+        end else if (sel & wstrb) begin
+            case (reg_sel)
+                REG_DATA: gpio_data_reg <= wdata;
+                REG_DIR:  gpio_dir_reg  <= wdata;
+                default:  ;
+            endcase
+        end
+    end
+
+    // Mask output pins by direction
+    assign gpio_out = gpio_data_reg & gpio_dir_reg;
+    assign gpio_dir = gpio_dir_reg;
+
+    // Combinational readback
+    always @(*) begin
+        case (reg_sel)
+            REG_DATA: rdata = gpio_data_reg;
+            REG_DIR:  rdata = gpio_dir_reg;
+            REG_READ: rdata = (gpio_dir_reg & gpio_data_reg) | (~gpio_dir_reg & gpio_in);
+            default:  rdata = 32'b0;
+        endcase
+    end
+endmodule
+```
+
+#### How Direction Affects Behavior
+- **Outputs (`GPIO_DIR = 1`):** The output driver drives the value from `GPIO_DATA` to the pin. `GPIO_READ` returns the driven output value.
+- **Inputs (`GPIO_DIR = 0`):** The output driver is disabled (high-impedance, reading `0` in simulation loopback). `GPIO_READ` returns the external state from the `gpio_in` pin.
+
+---
+
+### Step 3 — Integrate into the SoC (`riscv.v`)
+
+`GPIO_CTRL` was integrated by mapping it to a separate address space (`0x400100` via `mem_addr[8]`), routing it into `IO_rdata`, and exposing outputs:
+
+```verilog
+wire isGPIOCTRL = isIO & mem_addr[8];
+wire [31:0] gpioctrl_rdata;
+wire [31:0] gpioctrl_out_w;
+
+GPIO_CTRL gpio_ctrl (
+   .clk     (clk),
+   .resetn  (resetn),
+   .sel     (isGPIOCTRL),
+   .reg_sel (mem_addr[3:2]),
+   .wstrb   (mem_wstrb),
+   .wdata   (mem_wdata),
+   .rdata   (gpioctrl_rdata),
+   .gpio_in (gpioctrl_out_w),  // loopback in simulation
+   .gpio_out(gpioctrl_out_w),
+   .gpio_dir(GPIOCTRL_DIR)
+);
+assign GPIOCTRL_OUT = gpioctrl_out_w;
+```
+
+---
+
+### Step 4 — Software Validation
+
+A bare-metal C program (`firmware/gpio_ctrl_test.c`) was written to run four test scenarios verifying input, output, mixed direction, and register readback:
+
+```c
+#define GPIO_DATA  (*(volatile uint32_t*)(0x400100))
+#define GPIO_DIR   (*(volatile uint32_t*)(0x400104))
+#define GPIO_READ  (*(volatile uint32_t*)(0x400108))
+
+int main(void) {
+    // 1. All outputs: write DATA, read GPIO_READ
+    GPIO_DIR  = 0xFFFFFFFFu;
+    GPIO_DATA = 0xDEADBEEFu;
+    print_result("GPIO_READ (all out)", GPIO_READ, 0xDEADBEEFu);
+
+    // 2. All inputs: write DATA, read GPIO_READ -> should be 0 (loopback)
+    GPIO_DIR  = 0x00000000u;
+    GPIO_DATA = 0xA5A5A5A5u;
+    print_result("GPIO_READ (all in) ", GPIO_READ, 0x00000000u);
+
+    // 3. Mixed dir: lower 16 out, upper 16 in
+    GPIO_DIR  = 0x0000FFFFu;
+    GPIO_DATA = 0x12345678u;
+    print_result("GPIO_READ (mixed)  ", GPIO_READ, 0x00005678u);
+
+    // 4. DIR register readback
+    GPIO_DIR = 0xCAFEBABEu;
+    print_result("GPIO_DIR readback  ", GPIO_DIR, 0xCAFEBABEu);
+}
+```
+
+---
+
+### Step 5 — Simulation Verification
+
+The testbench compiles the `gpio_ctrl_test.c` firmware, loads it into instruction memory, and simulates using `iverilog`:
+
+```bash
+# Compile and run
+iverilog -DBENCH -DSIM -g2012 -o SOC_sim.vvp SOC_sim_top.v riscv.v
+vvp SOC_sim.vvp
+```
+
+**Simulation Output:**
+```
+=== GPIO_CTRL Multi-Register Test ===
+
+[Test 1] All Outputs (DIR=0xFFFFFFFF)
+  GPIO_DATA readback: 0xDEADBEEF  [ PASS ]
+  GPIO_READ (all out): 0xDEADBEEF  [ PASS ]
+
+[Test 2] All Inputs (DIR=0x00000000)
+  GPIO_READ (all in) : 0x00000000  [ PASS ]
+
+[Test 3] Mixed Dir (DIR=0x0000FFFF, lower=out, upper=in)
+  GPIO_READ (mixed)  : 0x00005678  [ PASS ]
+
+[Test 4] DIR Register Readback
+  GPIO_DIR readback  : 0xCAFEBABE  [ PASS ]
+
+------------------------------
+Results: 5/5 passed
+```
+
+> **GTKWave Waveform Screenshot:**
+
+![GTKWave simulation screenshot for Task 5](images/task5/a.png)
+
+---
+
 ## Repository Structure
 
 ```
@@ -744,8 +922,10 @@ VSD-internship/
 │   │   ├── f.png       # Spike simulation VSD ASCII art output
 │   │   ├── g.png       # Installing dependencies on local Fedora
 │   │   └── h.png       # Local Fedora toolchain verification
-│   └── task4/          # Screenshots for Task 4
-│       └── a.png       # GTKWave simulation screenshot
+│   ├── task4/          # Screenshots for Task 4
+│   │   └── a.png       # GTKWave simulation screenshot
+│   └── task5/          # Screenshots for Task 5
+│       └── a.png       # GTKWave simulation screenshot placeholder
 └── README.md
 ```
 
