@@ -13,6 +13,7 @@
 | 3 | [Task 3](#task-3-risc-v-reference-design-bring-up) | Use the VSD Codespace to run a pre-built RISC-V + FPGA environment and replicate the toolchain locally |
 | 4 | [Task 4](#task-4-gpio32-ip-design-integration--simulation) | Design a 32-bit memory-mapped GPIO register IP, integrate it into the basicRISCV SoC, and verify with Icarus Verilog simulation |
 | 5 | [Task 5](#task-5-design-a-multi-register-gpio-ip-with-software-control) | Extend the simple GPIO IP into a multi-register GPIO peripheral with software-controlled direction and input/output modes |
+| 6 | [Task 6](#task-6-programmable-countdown-timer-ip) | Design and integrate a programmable countdown timer IP with one-shot, periodic, and prescaler modes into the basicRISCV SoC |
 
 ---
 
@@ -895,6 +896,179 @@ Results: 5/5 passed
 
 ---
 
+## Task 6: Programmable Countdown Timer IP
+
+**Objective:** Design a memory-mapped countdown timer IP and integrate it into the basicRISCV SoC. The timer supports configurable countdown with one-shot and periodic (auto-reload) modes, a programmable prescaler for long timeouts, and a write-1-to-clear timeout status flag. Software running on the RISC-V core validates all modes via UART output, and the timeout event toggles an LED for observable hardware behaviour.
+
+---
+
+### Step 1 — Register Map Design
+
+The Timer peripheral is mapped to base address **`0x400200`** in the SoC memory map. The block is selected when `isIO = 1` and `mem_addr[9] = 1`. Register offsets are decoded by `mem_addr[3:2]`:
+
+| Offset | Register | R/W | Description |
+|--------|----------|-----|-------------|
+| `0x00` | CTRL     | R/W | Control register |
+| `0x04` | LOAD     | R/W | Countdown start value |
+| `0x08` | VALUE    | R   | Current countdown value (read-only) |
+| `0x0C` | STATUS   | R/W | Timeout status (write-1-to-clear) |
+
+#### CTRL Register Bit Fields
+
+| Bits   | Field     | Description |
+|--------|-----------|-------------|
+| [0]    | EN        | 1 = enable counting, 0 = freeze |
+| [1]    | MODE      | 0 = one-shot (stops at 0), 1 = periodic (auto-reload) |
+| [2]    | PRESC_EN  | 1 = enable prescaler |
+| [15:8] | PRESC_DIV | Prescaler value; timer decrements every (PRESC_DIV+1) clocks |
+
+---
+
+### Step 2 — Implement Timer RTL (`TIMER.v`)
+
+Key design elements of the synchronous Verilog implementation:
+
+```verilog
+module TIMER (
+    input             clk,
+    input             resetn,
+    input             sel,
+    input      [1:0]  reg_sel,    // mem_addr[3:2]
+    input             wstrb,
+    input      [31:0] wdata,
+    output reg [31:0] rdata,
+    output            timeout_irq
+);
+    localparam REG_CTRL   = 2'b00;
+    localparam REG_LOAD   = 2'b01;
+    localparam REG_VALUE  = 2'b10;
+    localparam REG_STATUS = 2'b11;
+
+    // Prescaler tick
+    assign tick = ctrl_presc_en ? (presc_cnt == 8'd0) : 1'b1;
+
+    // On timeout:
+    //   One-shot  → clear EN (timer stops)
+    //   Periodic  → reload VALUE from LOAD
+    always @(posedge clk) begin
+        if (value_reg == 32'd1 && ctrl_en && tick) begin
+            value_reg      <= 32'd0;
+            status_timeout <= 1'b1;
+            if (!ctrl_mode) ctrl_en <= 1'b0;   // one-shot stop
+        end
+    end
+
+    // Write-1-to-clear STATUS
+    // VALUE is read-only (writes ignored)
+    assign timeout_irq = status_timeout;
+endmodule
+```
+
+#### Design Decisions
+- **VALUE loads only on EN rising edge**: prevents accidental reloads when only MODE/PRESC bits change.
+- **One-shot auto-stops**: `ctrl_en` is cleared in hardware on timeout — no software stop needed.
+- **Prescaler initialises to PRESC_DIV**: first tick fires after exactly (PRESC_DIV+1) clocks.
+
+---
+
+### Step 3 — Integrate into the SoC (`riscv.v`)
+
+```verilog
+wire isTimer = isIO & mem_addr[9];   // 0x400200
+wire [31:0] timer_rdata;
+
+TIMER timer_ip (
+   .clk        (clk),
+   .resetn     (resetn),
+   .sel        (isTimer),
+   .reg_sel    (mem_addr[3:2]),
+   .wstrb      (mem_wstrb),
+   .wdata      (mem_wdata),
+   .rdata      (timer_rdata),
+   .timeout_irq(TIMER_TIMEOUT)
+);
+
+// Extended IO_rdata mux
+wire [31:0] IO_rdata =
+    mem_wordaddr[IO_UART_CNTL_bit] ? {22'b0, !uart_ready, 9'b0} :
+    mem_wordaddr[IO_GPIO_bit]      ? gpio_rdata    :
+    isGPIOCTRL                     ? gpioctrl_rdata:
+    isTimer                        ? timer_rdata   :
+                                     32'b0;
+```
+
+---
+
+### Step 4 — Software Validation (`timer_test.c`)
+
+```c
+#define TIMER_BASE    0x400200u
+#define TIMER_CTRL    (*(volatile uint32_t*)(TIMER_BASE + 0x00))
+#define TIMER_LOAD    (*(volatile uint32_t*)(TIMER_BASE + 0x04))
+#define TIMER_VALUE   (*(volatile uint32_t*)(TIMER_BASE + 0x08))
+#define TIMER_STATUS  (*(volatile uint32_t*)(TIMER_BASE + 0x0C))
+
+// One-shot
+TIMER_LOAD   = 10u;
+TIMER_STATUS = STATUS_TIMEOUT;        // clear stale
+TIMER_CTRL   = CTRL_EN;              // enable, MODE=0
+while (!(TIMER_STATUS & STATUS_TIMEOUT));
+TIMER_STATUS = STATUS_TIMEOUT;        // clear
+
+// Periodic — toggle LED on each timeout
+TIMER_LOAD = 8u;
+TIMER_CTRL = CTRL_EN | CTRL_PERIODIC;
+for (int i = 0; i < 3; i++) {
+    while (!(TIMER_STATUS & STATUS_TIMEOUT));
+    TIMER_STATUS = STATUS_TIMEOUT;
+    LEDS = (uint32_t)(i & 1u);        // toggle
+}
+
+// Prescaler (divide by 3)
+TIMER_LOAD = 4u;
+TIMER_CTRL = CTRL_EN | CTRL_PRESC_EN | CTRL_PRESC(2);
+```
+
+---
+
+### Step 5 — Simulation Verification
+
+```bash
+cd RTL/firmware && make          # compiles timer_test.c → firmware.hex
+cd RTL
+iverilog -DBENCH -DSIM -g2012 -o SOC_sim.vvp SOC_sim_top.v riscv.v
+vvp SOC_sim.vvp
+```
+
+**Simulation Output:**
+```
+=== TIMER IP Test (Task 6) ===
+
+[Test 1] One-shot mode (LOAD=10)
+  VALUE after timeout: 0x00000000
+  VALUE == 0  [ PASS ]
+  STATUS.TIMEOUT set  [ PASS ]
+  STATUS.TIMEOUT cleared  [ PASS ]
+
+[Test 2] Periodic mode (LOAD=8, 3 timeouts)
+  3 periodic timeouts received  [ PASS ]
+
+[Test 3] Prescaler mode (LOAD=4, PRESC_DIV=2)
+  VALUE == 0 after prescaled count  [ PASS ]
+  TIMEOUT set in prescaler mode  [ PASS ]
+
+[Test 4] VALUE decrements (LOAD=100)
+  VALUE mid-count: 0x00000059
+  VALUE < LOAD while counting  [ PASS ]
+
+------------------------------
+Results: 7/7 passed
+```
+
+![GTKWave waveform showing TIMER IP signals](images/task6/a.png)
+
+---
+
 ## Repository Structure
 
 ```
@@ -924,8 +1098,10 @@ VSD-internship/
 │   │   └── h.png       # Local Fedora toolchain verification
 │   ├── task4/          # Screenshots for Task 4
 │   │   └── a.png       # GTKWave simulation screenshot
-│   └── task5/          # Screenshots for Task 5
-│       └── a.png       # GTKWave simulation screenshot placeholder
+│   ├── task5/          # Screenshots for Task 5
+│   │   └── a.png       # GTKWave simulation screenshot
+│   └── task6/          # Screenshots for Task 6
+│       └── a.png       # GTKWave Timer IP waveform screenshot
 └── README.md
 ```
 
