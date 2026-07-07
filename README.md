@@ -14,6 +14,7 @@
 | 4 | [Task 4](#task-4-gpio32-ip-design-integration--simulation) | Design a 32-bit memory-mapped GPIO register IP, integrate it into the basicRISCV SoC, and verify with Icarus Verilog simulation |
 | 5 | [Task 5](#task-5-design-a-multi-register-gpio-ip-with-software-control) | Extend the simple GPIO IP into a multi-register GPIO peripheral with software-controlled direction and input/output modes |
 | 6 | [Task 6](#task-6-programmable-countdown-timer-ip) | Design and integrate a programmable countdown timer IP with one-shot, periodic, and prescaler modes into the basicRISCV SoC |
+| 7 | [Task 7](#task-7-commercial-grade-ip-documentation--release) | Package the Timer IP with commercial-grade documentation — user guide, register map, integration guide, and copy-paste C examples |
 
 ---
 
@@ -1069,6 +1070,131 @@ Results: 7/7 passed
 
 ---
 
+---
+
+## Task 7: Commercial-Grade IP Documentation & Release
+
+**Objective:** Package the Timer IP exactly like a commercial FPGA IP, so any user with a VSDSquadron FPGA board can integrate and use it without reading the RTL. The documentation assumes the reader did not write this IP.
+
+---
+
+### Deliverable Structure
+
+```
+ip/timer/
+├── rtl/
+│   └── TIMER.v                ← Single drop-in RTL file, no dependencies
+├── software/
+│   └── timer_test.c           ← 7/7 validation firmware + usage examples
+├── docs/
+│   ├── IP_User_Guide.md       ← Features, block diagram, modes, limitations
+│   ├── Register_Map.md        ← Full bit-level register reference
+│   ├── Integration_Guide.md   ← Step-by-step riscv.v integration + FPGA pins
+│   └── Example_Usage.md       ← 5 ready-to-run C code examples
+└── README.md                  ← 30-second overview and quick start
+```
+
+---
+
+### IP Overview
+
+The **TIMER IP** is a programmable 32-bit countdown timer for the basicRISCV SoC. It is memory-mapped at base address `0x400200` and controlled entirely by software on the RISC-V core.
+
+**Typical use cases:**
+- Software delays (busy-wait for N clock cycles)
+- Periodic events (LED blink, scheduled task triggers)
+- Timeout detection in protocol handlers
+
+---
+
+### Feature Summary
+
+| Feature | Details |
+|---------|--------|
+| Counter width | 32-bit countdown |
+| Modes | One-shot (stops at 0), Periodic (auto-reload) |
+| Prescaler | Optional ÷(PRESC_DIV+1), 8-bit divisor (max ÷256) |
+| Bus interface | 32-bit memory-mapped, word-aligned |
+| Interrupt support | **None** — polling only |
+| Observable output | `TIMER_TIMEOUT` port (routes to LED or header pin) |
+| Reset | Synchronous, active-low |
+
+---
+
+### Register Map
+
+**Base address: `0x400200`** — decoded as `isIO & mem_addr[9]`
+
+| Offset | Address | Register | R/W | Description |
+|--------|---------|----------|-----|-------------|
+| `0x00` | `0x400200` | CTRL | R/W | `[0]`=EN, `[1]`=MODE, `[2]`=PRESC_EN, `[15:8]`=PRESC_DIV |
+| `0x04` | `0x400204` | LOAD | R/W | 32-bit countdown start value |
+| `0x08` | `0x400208` | VALUE | R | Current countdown (read-only, writes ignored) |
+| `0x0C` | `0x40020C` | STATUS | R/W | `[0]`=TIMEOUT (write-1-to-clear) |
+
+---
+
+### Software Programming Model
+
+#### Initialization sequence
+```c
+TIMER_CTRL   = 0;                  // 1. Disable (safe start)
+TIMER_LOAD   = <count_value>;      // 2. Set load value
+TIMER_STATUS = 1;                  // 3. Clear stale TIMEOUT flag
+TIMER_CTRL   = CTRL_EN;           // 4. Enable (VALUE loads from LOAD here)
+```
+
+#### Polling sequence
+```c
+while (!(TIMER_STATUS & 1));       // Poll TIMEOUT bit
+TIMER_STATUS = 1;                  // Write-1-to-clear
+```
+
+#### 30-second quick start
+```c
+// Wait 1000 clock cycles, then continue
+TIMER_LOAD = 1000; TIMER_STATUS = 1; TIMER_CTRL = 0x01;
+while (!(TIMER_STATUS & 1)); TIMER_STATUS = 1;
+```
+
+---
+
+### Integration Summary
+
+Only 4 changes needed in `riscv.v`:
+
+1. `` `include "TIMER.v" `` — at top of file
+2. `output TIMER_TIMEOUT` — added to SOC module ports
+3. `wire isTimer = isIO & mem_addr[9]` — block-select decode
+4. Instantiate `TIMER timer_ip(...)` and extend `IO_rdata` mux
+
+See [`ip/timer/docs/Integration_Guide.md`](../vsdfpga_labs/basicRISCV/RTL/ip/timer/docs/Integration_Guide.md) for the exact line-by-line diff.
+
+---
+
+### Board-Level Usage (VSDSquadron FPGA)
+
+`TIMER_TIMEOUT` is exposed as a top-level SoC output. Connect it to a VSDSquadron LED in your top-level Verilog:
+
+```verilog
+assign LED0 = TIMER_TIMEOUT;
+```
+
+In periodic mode, the LED reflects the TIMEOUT flag state — stays high between timeout and software clear. For a clean toggle, the firmware clears the flag on each event (demonstrated in `timer_test.c`).
+
+---
+
+### Documentation Highlights
+
+| Document | Key content |
+|----------|------------|
+| `IP_User_Guide.md` | Block diagram (ASCII), timing diagram, prescaler table, mode descriptions |
+| `Register_Map.md` | Bit-field diagrams for all 4 registers, reset values, write-1-to-clear rules |
+| `Integration_Guide.md` | Exact `riscv.v` edits, full IO address map, FPGA pin routing, `.pcf` notes |
+| `Example_Usage.md` | 5 examples: delay, LED blink, prescaler, cycle measurement, periodic counter |
+
+---
+
 ## Repository Structure
 
 ```
@@ -1104,6 +1230,8 @@ VSD-internship/
 │       └── a.png       # GTKWave Timer IP waveform screenshot
 └── README.md
 ```
+
+> **RTL + IP sources** live in the `basicRISCV` repository under `RTL/`. The `ip/timer/` folder contains the full commercial-grade IP package.
 
 ---
 
